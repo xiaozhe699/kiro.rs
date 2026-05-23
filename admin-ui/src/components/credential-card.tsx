@@ -49,6 +49,20 @@ function formatLastUsed(lastUsedAt: string | null): string {
   return `${days} 天前`
 }
 
+function formatRateLimitedUntil(rateLimitedUntil?: string): string {
+  if (!rateLimitedUntil) return '未知'
+  const date = new Date(rateLimitedUntil)
+  const now = new Date()
+  const diff = date.getTime() - now.getTime()
+  if (diff <= 0) return '即将恢复'
+  const seconds = Math.ceil(diff / 1000)
+  const minutes = Math.ceil(seconds / 60)
+  if (minutes < 60) return `${date.toLocaleString()}（约 ${minutes} 分钟后）`
+  const hours = Math.floor(minutes / 60)
+  const restMinutes = minutes % 60
+  return `${date.toLocaleString()}（约 ${hours} 小时 ${restMinutes} 分钟后）`
+}
+
 export function CredentialCard({
   credential,
   onViewBalance,
@@ -162,6 +176,9 @@ export function CredentialCard({
                 {credential.disabled && credential.disabledReason && (
                   <Badge variant="outline">{credential.disabledReason}</Badge>
                 )}
+                {credential.coolingDown && (
+                  <Badge variant="warning">429冷却中</Badge>
+                )}
                 {credential.authMethod && (
                   <Badge variant="secondary">
                     {credential.authMethod === 'api_key' ? 'API Key' :
@@ -258,6 +275,14 @@ export function CredentialCard({
               <span className="text-muted-foreground">最后调用：</span>
               <span className="font-medium">{formatLastUsed(credential.lastUsedAt)}</span>
             </div>
+            {credential.coolingDown && (
+              <div className="col-span-2">
+                <span className="text-muted-foreground">429 冷却至：</span>
+                <span className="font-medium text-yellow-600">
+                  {formatRateLimitedUntil(credential.rateLimitedUntil)}
+                </span>
+              </div>
+            )}
             {credential.maskedApiKey && (
               <div className="col-span-2">
                 <span className="text-muted-foreground">API Key：</span>

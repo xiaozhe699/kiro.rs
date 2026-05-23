@@ -22,6 +22,8 @@ export interface CredentialStatusItem {
   maskedApiKey?: string
   successCount: number
   lastUsedAt: string | null
+  rateLimitedUntil?: string
+  coolingDown: boolean
   hasProxy: boolean
   proxyUrl?: string
   refreshFailureCount: number
