@@ -50,6 +50,11 @@ pub struct CredentialStatusItem {
     pub success_count: u64,
     /// 最后一次 API 调用时间（RFC3339 格式）
     pub last_used_at: Option<String>,
+    /// 429 限流冷却截止时间（RFC3339 格式）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rate_limited_until: Option<String>,
+    /// 是否正在 429 冷却期
+    pub cooling_down: bool,
     /// 是否配置了凭据级代理
     pub has_proxy: bool,
     /// 代理 URL（用于前端展示）

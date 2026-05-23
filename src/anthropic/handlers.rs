@@ -24,11 +24,30 @@ use uuid::Uuid;
 use super::converter::{ConversionError, convert_request};
 use super::middleware::AppState;
 use super::stream::{BufferedStreamContext, SseEvent, StreamContext};
-use super::types::{CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse, OutputConfig, Thinking};
+use super::types::{
+    CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse,
+    OutputConfig, Thinking,
+};
 use super::websearch;
+use crate::kiro::provider::RateLimitError;
 
 /// 将 KiroProvider 错误映射为 HTTP 响应
 fn map_provider_error(err: Error) -> Response {
+    if let Some(rate_limit) = err.downcast_ref::<RateLimitError>() {
+        tracing::warn!(error = %err, "上游账号均处于 429 限流冷却中");
+        let mut response = (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(ErrorResponse::new("rate_limit_error", rate_limit.to_string())),
+        )
+            .into_response();
+        if let Some(retry_after) = rate_limit.retry_after_seconds() {
+            if let Ok(value) = header::HeaderValue::from_str(&retry_after.to_string()) {
+                response.headers_mut().insert(header::RETRY_AFTER, value);
+            }
+        }
+        return response;
+    }
+
     let err_str = err.to_string();
 
     // 上下文窗口满了（对话历史累积超出模型上下文窗口限制）
@@ -953,4 +972,31 @@ fn create_buffered_sse_stream(
         },
     )
     .flatten()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_map_provider_error_returns_429_for_rate_limit_error() {
+        let response = map_provider_error(
+            RateLimitError::new(
+                "All available upstream credentials are currently rate limited.",
+                Some(42),
+            )
+            .into(),
+        );
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::RETRY_AFTER)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "42"
+        );
+    }
 }
