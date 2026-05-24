@@ -5,5 +5,10 @@
   "tlsBackend": "rustls",
   "region": "us-east-1",
   "adminApiKey": "sk-admin-your-secret-key",
+  "rateLimitRetriesPerCredential": 2,
+  "rateLimitCooldownSeconds": 1800,
+  "rateLimitMaxCooledCredentialsPerRequest": 2,
+  "suspiciousRateLimitRetriesPerCredential": 0,
+  "suspiciousRateLimitCooldownSeconds": 1800,
   "defaultEndpoint": "ide"
 }

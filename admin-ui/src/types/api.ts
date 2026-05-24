@@ -24,6 +24,7 @@ export interface CredentialStatusItem {
   lastUsedAt: string | null
   rateLimitedUntil?: string
   coolingDown: boolean
+  rateLimitedReason?: 'normal' | 'suspicious' | string
   hasProxy: boolean
   proxyUrl?: string
   refreshFailureCount: number

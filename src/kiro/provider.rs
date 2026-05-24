@@ -16,7 +16,7 @@ use crate::http_client::{ProxyConfig, build_client};
 use crate::kiro::endpoint::{KiroEndpoint, RequestContext};
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
-use crate::kiro::token_manager::{CallContext, MultiTokenManager};
+use crate::kiro::token_manager::{CallContext, MultiTokenManager, RateLimitReason};
 use crate::model::config::TlsBackend;
 use parking_lot::Mutex;
 
@@ -25,6 +25,28 @@ const MAX_RETRIES_PER_CREDENTIAL: usize = 3;
 
 /// 总重试次数硬上限（避免无限重试）
 const MAX_TOTAL_RETRIES: usize = 9;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UpstreamRateLimitKind {
+    Normal,
+    Suspicious,
+}
+
+impl UpstreamRateLimitKind {
+    fn as_log_label(self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::Suspicious => "suspicious",
+        }
+    }
+
+    fn reason(self) -> RateLimitReason {
+        match self {
+            Self::Normal => RateLimitReason::Normal,
+            Self::Suspicious => RateLimitReason::Suspicious,
+        }
+    }
+}
 
 /// 上游账号均处于 429 限流时返回的结构化错误
 #[derive(Debug)]
@@ -149,20 +171,95 @@ impl KiroProvider {
         Duration::from_secs(self.token_manager.config().rate_limit_cooldown_seconds.max(1))
     }
 
+    fn suspicious_rate_limit_retries_per_credential(&self) -> usize {
+        self.token_manager
+            .config()
+            .suspicious_rate_limit_retries_per_credential
+            .try_into()
+            .unwrap_or(0)
+    }
+
+    fn suspicious_rate_limit_cooldown(&self) -> Duration {
+        Duration::from_secs(
+            self.token_manager
+                .config()
+                .suspicious_rate_limit_cooldown_seconds
+                .max(1),
+        )
+    }
+
+    fn rate_limit_max_cooled_credentials_per_request(&self) -> usize {
+        self.token_manager
+            .config()
+            .rate_limit_max_cooled_credentials_per_request
+            .max(1)
+            .try_into()
+            .unwrap_or(2)
+    }
+
+    fn retries_for_rate_limit_kind(&self, kind: UpstreamRateLimitKind) -> usize {
+        match kind {
+            UpstreamRateLimitKind::Normal => self.rate_limit_retries_per_credential(),
+            UpstreamRateLimitKind::Suspicious => {
+                self.suspicious_rate_limit_retries_per_credential()
+            }
+        }
+    }
+
+    fn cooldown_for_rate_limit_kind(&self, kind: UpstreamRateLimitKind) -> Duration {
+        match kind {
+            UpstreamRateLimitKind::Normal => self.rate_limit_cooldown(),
+            UpstreamRateLimitKind::Suspicious => self.suspicious_rate_limit_cooldown(),
+        }
+    }
+
+    fn classify_rate_limit_body(body: &str) -> UpstreamRateLimitKind {
+        let normalized = body.to_ascii_lowercase();
+        if normalized.contains("suspicious activity")
+            || normalized.contains("temporary limits")
+            || normalized.contains("while we investigate")
+        {
+            UpstreamRateLimitKind::Suspicious
+        } else {
+            UpstreamRateLimitKind::Normal
+        }
+    }
+
     fn rate_limit_error(
         &self,
         model: Option<&str>,
         fallback_retry_after_seconds: Option<u64>,
+        message: &'static str,
     ) -> anyhow::Error {
         let retry_after = self
             .token_manager
             .rate_limit_retry_after_seconds(model)
             .or(fallback_retry_after_seconds);
-        RateLimitError::new(
+        RateLimitError::new(message, retry_after).into()
+    }
+
+    fn all_credentials_rate_limit_error(
+        &self,
+        model: Option<&str>,
+        fallback_retry_after_seconds: Option<u64>,
+    ) -> anyhow::Error {
+        self.rate_limit_error(
+            model,
+            fallback_retry_after_seconds,
             "All available upstream credentials are currently rate limited.",
-            retry_after,
         )
-        .into()
+    }
+
+    fn per_request_rate_limit_error(
+        &self,
+        model: Option<&str>,
+        fallback_retry_after_seconds: Option<u64>,
+    ) -> anyhow::Error {
+        self.rate_limit_error(
+            model,
+            fallback_retry_after_seconds,
+            "Upstream rate limit protection is active for this request. Please retry later.",
+        )
     }
 
     async fn send_mcp_once(
@@ -241,7 +338,12 @@ impl KiroProvider {
         let total_credentials = self.token_manager.total_count();
         let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
         let rate_limit_retries = self.rate_limit_retries_per_credential();
+        let suspicious_rate_limit_retries = self.suspicious_rate_limit_retries_per_credential();
+        let max_credential_rate_limit_retries =
+            rate_limit_retries.max(suspicious_rate_limit_retries);
         let rate_limit_cooldown = self.rate_limit_cooldown();
+        let max_cooled_credentials = self.rate_limit_max_cooled_credentials_per_request();
+        let mut cooled_credentials = 0usize;
         let mut last_error: Option<anyhow::Error> = None;
         let mut force_refreshed: HashSet<u64> = HashSet::new();
 
@@ -251,7 +353,10 @@ impl KiroProvider {
                 Ok(c) => c,
                 Err(e) => {
                     if self.token_manager.rate_limit_retry_after_seconds(None).is_some() {
-                        return Err(self.rate_limit_error(None, Some(rate_limit_cooldown.as_secs())));
+                        return Err(self.all_credentials_rate_limit_error(
+                            None,
+                            Some(rate_limit_cooldown.as_secs()),
+                        ));
                     }
                     last_error = Some(e);
                     continue;
@@ -268,7 +373,7 @@ impl KiroProvider {
                 }
             };
 
-            for credential_attempt in 0..=rate_limit_retries {
+            for credential_attempt in 0..=max_credential_rate_limit_retries {
                 let response = match self.send_mcp_once(&ctx, &endpoint, request_body).await {
                     Ok(resp) => resp,
                     Err(e) => {
@@ -298,12 +403,17 @@ impl KiroProvider {
                 let body = response.text().await.unwrap_or_default();
 
                 if status.as_u16() == 429 {
-                    if credential_attempt < rate_limit_retries {
+                    let rate_limit_kind = Self::classify_rate_limit_body(&body);
+                    let retries_for_kind = self.retries_for_rate_limit_kind(rate_limit_kind);
+                    let cooldown_for_kind = self.cooldown_for_rate_limit_kind(rate_limit_kind);
+
+                    if credential_attempt < retries_for_kind {
                         tracing::warn!(
-                            "MCP 请求触发 429（凭据 #{}，账号内重试 {}/{}）: {}",
+                            "MCP 请求触发 429（类型 {}，凭据 #{}，账号内重试 {}/{}）: {}",
+                            rate_limit_kind.as_log_label(),
                             ctx.id,
                             credential_attempt + 1,
-                            rate_limit_retries,
+                            retries_for_kind,
                             body
                         );
                         sleep(Self::retry_delay(credential_attempt)).await;
@@ -311,17 +421,31 @@ impl KiroProvider {
                     }
 
                     tracing::warn!(
-                        "MCP 请求凭据 #{} 连续触发 429，进入冷却 {} 秒",
+                        "MCP 请求凭据 #{} 触发 {} 429，进入冷却 {} 秒",
                         ctx.id,
-                        rate_limit_cooldown.as_secs()
+                        rate_limit_kind.as_log_label(),
+                        cooldown_for_kind.as_secs()
                     );
+                    cooled_credentials += 1;
                     let has_available = self
                         .token_manager
-                        .report_rate_limited(ctx.id, rate_limit_cooldown);
-                    last_error =
-                        Some(self.rate_limit_error(None, Some(rate_limit_cooldown.as_secs())));
+                        .report_rate_limited(ctx.id, cooldown_for_kind, rate_limit_kind.reason());
+                    last_error = Some(self.all_credentials_rate_limit_error(
+                        None,
+                        Some(cooldown_for_kind.as_secs()),
+                    ));
                     if !has_available {
                         return Err(last_error.unwrap());
+                    }
+                    if cooled_credentials >= max_cooled_credentials {
+                        tracing::warn!(
+                            "MCP 请求触发 429 熔断保护：本次请求已冷却 {} 个凭据，停止继续切换账号",
+                            cooled_credentials
+                        );
+                        return Err(self.per_request_rate_limit_error(
+                            None,
+                            Some(cooldown_for_kind.as_secs()),
+                        ));
                     }
                     continue 'outer;
                 }
@@ -412,7 +536,12 @@ impl KiroProvider {
         let total_credentials = self.token_manager.total_count();
         let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
         let rate_limit_retries = self.rate_limit_retries_per_credential();
+        let suspicious_rate_limit_retries = self.suspicious_rate_limit_retries_per_credential();
+        let max_credential_rate_limit_retries =
+            rate_limit_retries.max(suspicious_rate_limit_retries);
         let rate_limit_cooldown = self.rate_limit_cooldown();
+        let max_cooled_credentials = self.rate_limit_max_cooled_credentials_per_request();
+        let mut cooled_credentials = 0usize;
         let mut last_error: Option<anyhow::Error> = None;
         let mut force_refreshed: HashSet<u64> = HashSet::new();
         let api_type = if is_stream { "流式" } else { "非流式" };
@@ -430,7 +559,7 @@ impl KiroProvider {
                         .rate_limit_retry_after_seconds(model.as_deref())
                         .is_some()
                     {
-                        return Err(self.rate_limit_error(
+                        return Err(self.all_credentials_rate_limit_error(
                             model.as_deref(),
                             Some(rate_limit_cooldown.as_secs()),
                         ));
@@ -449,7 +578,7 @@ impl KiroProvider {
                 }
             };
 
-            for credential_attempt in 0..=rate_limit_retries {
+            for credential_attempt in 0..=max_credential_rate_limit_retries {
                 let response = match self.send_api_once(&ctx, &endpoint, request_body).await {
                     Ok(resp) => resp,
                     Err(e) => {
@@ -481,13 +610,18 @@ impl KiroProvider {
                 let body = response.text().await.unwrap_or_default();
 
                 if status.as_u16() == 429 {
-                    if credential_attempt < rate_limit_retries {
+                    let rate_limit_kind = Self::classify_rate_limit_body(&body);
+                    let retries_for_kind = self.retries_for_rate_limit_kind(rate_limit_kind);
+                    let cooldown_for_kind = self.cooldown_for_rate_limit_kind(rate_limit_kind);
+
+                    if credential_attempt < retries_for_kind {
                         tracing::warn!(
-                            "{} API 请求触发 429（凭据 #{}，账号内重试 {}/{}）: {}",
+                            "{} API 请求触发 429（类型 {}，凭据 #{}，账号内重试 {}/{}）: {}",
                             api_type,
+                            rate_limit_kind.as_log_label(),
                             ctx.id,
                             credential_attempt + 1,
-                            rate_limit_retries,
+                            retries_for_kind,
                             body
                         );
                         sleep(Self::retry_delay(credential_attempt)).await;
@@ -495,20 +629,33 @@ impl KiroProvider {
                     }
 
                     tracing::warn!(
-                        "{} API 请求凭据 #{} 连续触发 429，进入冷却 {} 秒",
+                        "{} API 请求凭据 #{} 触发 {} 429，进入冷却 {} 秒",
                         api_type,
                         ctx.id,
-                        rate_limit_cooldown.as_secs()
+                        rate_limit_kind.as_log_label(),
+                        cooldown_for_kind.as_secs()
                     );
+                    cooled_credentials += 1;
                     let has_available = self
                         .token_manager
-                        .report_rate_limited(ctx.id, rate_limit_cooldown);
-                    last_error = Some(self.rate_limit_error(
+                        .report_rate_limited(ctx.id, cooldown_for_kind, rate_limit_kind.reason());
+                    last_error = Some(self.all_credentials_rate_limit_error(
                         model.as_deref(),
-                        Some(rate_limit_cooldown.as_secs()),
+                        Some(cooldown_for_kind.as_secs()),
                     ));
                     if !has_available {
                         return Err(last_error.unwrap());
+                    }
+                    if cooled_credentials >= max_cooled_credentials {
+                        tracing::warn!(
+                            "{} API 请求触发 429 熔断保护：本次请求已冷却 {} 个凭据，停止继续切换账号",
+                            api_type,
+                            cooled_credentials
+                        );
+                        return Err(self.per_request_rate_limit_error(
+                            model.as_deref(),
+                            Some(cooldown_for_kind.as_secs()),
+                        ));
                     }
                     continue 'outer;
                 }
@@ -670,5 +817,28 @@ impl KiroProvider {
         let jitter_max = (backoff / 4).max(1);
         let jitter = fastrand::u64(0..=jitter_max);
         Duration::from_millis(backoff.saturating_add(jitter))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_classify_suspicious_rate_limit_body() {
+        let body = "Due to suspicious activity, we are imposing temporary limits while we investigate.";
+        assert_eq!(
+            KiroProvider::classify_rate_limit_body(body),
+            UpstreamRateLimitKind::Suspicious
+        );
+    }
+
+    #[test]
+    fn test_classify_normal_rate_limit_body() {
+        let body = r#"{"message":"Too many requests"}"#;
+        assert_eq!(
+            KiroProvider::classify_rate_limit_body(body),
+            UpstreamRateLimitKind::Normal
+        );
     }
 }

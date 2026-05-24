@@ -84,6 +84,7 @@ impl AdminService {
                 last_used_at: entry.last_used_at.clone(),
                 rate_limited_until: entry.rate_limited_until,
                 cooling_down: entry.cooling_down,
+                rate_limited_reason: entry.rate_limited_reason,
                 has_proxy: entry.has_proxy,
                 proxy_url: entry.proxy_url,
                 refresh_failure_count: entry.refresh_failure_count,

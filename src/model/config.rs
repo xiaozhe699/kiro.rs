@@ -99,6 +99,18 @@ pub struct Config {
     #[serde(default = "default_rate_limit_cooldown_seconds")]
     pub rate_limit_cooldown_seconds: u64,
 
+    /// 单个请求最多允许触发 429 冷却的凭据数量，避免异常请求打穿账号池
+    #[serde(default = "default_rate_limit_max_cooled_credentials_per_request")]
+    pub rate_limit_max_cooled_credentials_per_request: u32,
+
+    /// 疑似风控型 429 的账号内额外重试次数
+    #[serde(default = "default_suspicious_rate_limit_retries_per_credential")]
+    pub suspicious_rate_limit_retries_per_credential: u32,
+
+    /// 疑似风控型 429 的冷却时长（秒）
+    #[serde(default = "default_suspicious_rate_limit_cooldown_seconds")]
+    pub suspicious_rate_limit_cooldown_seconds: u64,
+
     /// 是否开启非流式响应的 thinking 块提取（默认 true）
     ///
     /// 启用后，非流式响应中的 `<thinking>...</thinking>` 标签会被解析为
@@ -167,6 +179,18 @@ fn default_rate_limit_cooldown_seconds() -> u64 {
     30 * 60
 }
 
+fn default_rate_limit_max_cooled_credentials_per_request() -> u32 {
+    2
+}
+
+fn default_suspicious_rate_limit_retries_per_credential() -> u32 {
+    0
+}
+
+fn default_suspicious_rate_limit_cooldown_seconds() -> u64 {
+    30 * 60
+}
+
 fn default_extract_thinking() -> bool {
     true
 }
@@ -199,6 +223,12 @@ impl Default for Config {
             load_balancing_mode: default_load_balancing_mode(),
             rate_limit_retries_per_credential: default_rate_limit_retries_per_credential(),
             rate_limit_cooldown_seconds: default_rate_limit_cooldown_seconds(),
+            rate_limit_max_cooled_credentials_per_request:
+                default_rate_limit_max_cooled_credentials_per_request(),
+            suspicious_rate_limit_retries_per_credential:
+                default_suspicious_rate_limit_retries_per_credential(),
+            suspicious_rate_limit_cooldown_seconds:
+                default_suspicious_rate_limit_cooldown_seconds(),
             extract_thinking: default_extract_thinking(),
             default_endpoint: default_endpoint(),
             endpoints: HashMap::new(),

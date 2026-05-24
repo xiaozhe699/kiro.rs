@@ -55,6 +55,9 @@ pub struct CredentialStatusItem {
     pub rate_limited_until: Option<String>,
     /// 是否正在 429 冷却期
     pub cooling_down: bool,
+    /// 429 限流原因
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rate_limited_reason: Option<String>,
     /// 是否配置了凭据级代理
     pub has_proxy: bool,
     /// 代理 URL（用于前端展示）

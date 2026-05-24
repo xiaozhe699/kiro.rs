@@ -63,6 +63,12 @@ function formatRateLimitedUntil(rateLimitedUntil?: string): string {
   return `${date.toLocaleString()}（约 ${hours} 小时 ${restMinutes} 分钟后）`
 }
 
+function formatRateLimitedReason(reason?: string): string {
+  if (reason === 'suspicious') return '疑似风控限流'
+  if (reason === 'normal') return '普通限流'
+  return '未知限流'
+}
+
 export function CredentialCard({
   credential,
   onViewBalance,
@@ -177,7 +183,9 @@ export function CredentialCard({
                   <Badge variant="outline">{credential.disabledReason}</Badge>
                 )}
                 {credential.coolingDown && (
-                  <Badge variant="warning">429冷却中</Badge>
+                  <Badge variant="warning">
+                    {credential.rateLimitedReason === 'suspicious' ? '429风控冷却' : '429冷却中'}
+                  </Badge>
                 )}
                 {credential.authMethod && (
                   <Badge variant="secondary">
@@ -280,6 +288,14 @@ export function CredentialCard({
                 <span className="text-muted-foreground">429 冷却至：</span>
                 <span className="font-medium text-yellow-600">
                   {formatRateLimitedUntil(credential.rateLimitedUntil)}
+                </span>
+              </div>
+            )}
+            {credential.coolingDown && (
+              <div className="col-span-2">
+                <span className="text-muted-foreground">429 原因：</span>
+                <span className="font-medium text-yellow-600">
+                  {formatRateLimitedReason(credential.rateLimitedReason)}
                 </span>
               </div>
             )}

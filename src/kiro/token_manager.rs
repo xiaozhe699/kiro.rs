@@ -416,6 +416,26 @@ struct CredentialEntry {
     last_used_at: Option<String>,
     /// 429 限流冷却截止时间（运行时状态，不持久化）
     rate_limited_until: Option<DateTime<Utc>>,
+    /// 429 限流原因（运行时状态，不持久化）
+    rate_limited_reason: Option<RateLimitReason>,
+}
+
+/// 429 限流原因
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RateLimitReason {
+    /// 普通上游限流
+    Normal,
+    /// 疑似上游风控限流
+    Suspicious,
+}
+
+impl RateLimitReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::Suspicious => "suspicious",
+        }
+    }
 }
 
 /// 禁用原因
@@ -481,6 +501,9 @@ pub struct CredentialEntrySnapshot {
     pub rate_limited_until: Option<String>,
     /// 是否正在 429 冷却期
     pub cooling_down: bool,
+    /// 429 限流原因
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rate_limited_reason: Option<String>,
     /// 是否配置了凭据级代理
     pub has_proxy: bool,
     /// 代理 URL（用于前端展示）
@@ -607,6 +630,7 @@ impl MultiTokenManager {
                     success_count: 0,
                     last_used_at: None,
                     rate_limited_until: None,
+                    rate_limited_reason: None,
                 }
             })
             .collect();
@@ -1186,6 +1210,7 @@ impl MultiTokenManager {
                 entry.failure_count = 0;
                 entry.refresh_failure_count = 0;
                 entry.rate_limited_until = None;
+                entry.rate_limited_reason = None;
                 entry.success_count += 1;
                 entry.last_used_at = Some(Utc::now().to_rfc3339());
                 tracing::debug!(
@@ -1202,7 +1227,12 @@ impl MultiTokenManager {
     ///
     /// 冷却不会持久化，也不会把凭据标记为 disabled；冷却期结束后自动重新参与选择。
     /// 返回当前是否还有可用凭据可以继续重试。
-    pub fn report_rate_limited(&self, id: u64, cooldown: StdDuration) -> bool {
+    pub fn report_rate_limited(
+        &self,
+        id: u64,
+        cooldown: StdDuration,
+        reason: RateLimitReason,
+    ) -> bool {
         let result = {
             let mut entries = self.entries.lock();
             let mut current_id = self.current_id.lock();
@@ -1214,10 +1244,12 @@ impl MultiTokenManager {
                 if !entry.disabled {
                     let until_text = until.to_rfc3339();
                     entry.rate_limited_until = Some(until);
+                    entry.rate_limited_reason = Some(reason);
                     entry.last_used_at = Some(now.to_rfc3339());
                     tracing::warn!(
-                        "凭据 #{} 触发上游 429，冷却至 {}",
+                        "凭据 #{} 触发上游 429（原因 {}），冷却至 {}",
                         id,
+                        reason.as_str(),
                         until_text
                     );
                 }
@@ -1564,6 +1596,11 @@ impl MultiTokenManager {
                             .as_ref()
                             .map(|until| until.to_rfc3339()),
                         cooling_down,
+                        rate_limited_reason: if cooling_down {
+                            e.rate_limited_reason.map(|reason| reason.as_str().to_string())
+                        } else {
+                            None
+                        },
                         has_proxy: e.credentials.proxy_url.is_some(),
                         proxy_url: e.credentials.proxy_url.clone(),
                         refresh_failure_count: e.refresh_failure_count,
@@ -1606,6 +1643,7 @@ impl MultiTokenManager {
                 entry.failure_count = 0;
                 entry.refresh_failure_count = 0;
                 entry.rate_limited_until = None;
+                entry.rate_limited_reason = None;
                 entry.disabled_reason = None;
             } else {
                 entry.disabled_reason = Some(DisabledReason::Manual);
@@ -1889,6 +1927,7 @@ impl MultiTokenManager {
                 success_count: 0,
                 last_used_at: None,
                 rate_limited_until: None,
+                rate_limited_reason: None,
             });
         }
 
@@ -2424,13 +2463,18 @@ mod tests {
             MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
 
         assert_eq!(manager.snapshot().current_id, 1);
-        assert!(manager.report_rate_limited(1, StdDuration::from_secs(60)));
+        assert!(manager.report_rate_limited(
+            1,
+            StdDuration::from_secs(60),
+            RateLimitReason::Normal
+        ));
         assert_eq!(manager.available_count(), 1);
 
         let snapshot = manager.snapshot();
         let first = snapshot.entries.iter().find(|e| e.id == 1).unwrap();
         assert!(first.cooling_down);
         assert!(first.rate_limited_until.is_some());
+        assert_eq!(first.rate_limited_reason.as_deref(), Some("normal"));
         assert_eq!(snapshot.current_id, 2);
 
         let ctx = manager.acquire_context(None).await.unwrap();
@@ -2447,7 +2491,11 @@ mod tests {
         let manager =
             MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
 
-        assert!(manager.report_rate_limited(1, StdDuration::from_secs(60)));
+        assert!(manager.report_rate_limited(
+            1,
+            StdDuration::from_secs(60),
+            RateLimitReason::Normal
+        ));
 
         let ctx = manager.acquire_context(None).await.unwrap();
         assert_eq!(ctx.id, 2);
@@ -2462,7 +2510,11 @@ mod tests {
         let manager =
             MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
 
-        manager.report_rate_limited(1, StdDuration::from_secs(60));
+        manager.report_rate_limited(
+            1,
+            StdDuration::from_secs(60),
+            RateLimitReason::Suspicious,
+        );
         {
             let mut entries = manager.entries.lock();
             let first = entries.iter_mut().find(|e| e.id == 1).unwrap();
@@ -2480,7 +2532,11 @@ mod tests {
         let cred = valid_test_credential("token1", 0);
         let manager = MultiTokenManager::new(config, vec![cred], None, None, false).unwrap();
 
-        assert!(!manager.report_rate_limited(1, StdDuration::from_secs(60)));
+        assert!(!manager.report_rate_limited(
+            1,
+            StdDuration::from_secs(60),
+            RateLimitReason::Normal
+        ));
         let retry_after = manager.rate_limit_retry_after_seconds(None).unwrap();
         assert!((1..=60).contains(&retry_after));
     }
